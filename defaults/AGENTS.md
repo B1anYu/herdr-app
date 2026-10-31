@@ -609,6 +609,12 @@ What's about the user, never a look:
   cargo). Read at start.
 - `font`, `font_size`, `ui_font`: used where the layout doesn't set its
   own. Herdr (main) leaves these unset. Bigger panels: `zoom`.
+- `font_weight`: the terminals' text weight, 100 to 900 (500 by default,
+  bold stays 700). Set `400` for the font's normal weight.
+- `cursor_style`: `"bar"`, `"block"` (default), `"underline"` or
+  `"hollow"`, and `cursor_blink`: `true` or `false`. These are the
+  cursor shown when the program hasn't picked one; a program's own
+  DECSCUSR wins. Changes apply live.
 - `theme`: a theme name or `{light, dark}`; used where the layout sets none.
   The theme picker overrides any layout and stays on that layout.
 - `colors`: theme color overrides (`{"accent":"#ff8800"}`), with the same
