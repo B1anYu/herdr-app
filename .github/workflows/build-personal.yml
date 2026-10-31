@@ -1,0 +1,78 @@
+# personal: builds this fork's Windows app and uploads it as a workflow artifact.
+# Upstream's release.yml publishes to herdr.dev and signs with Azure; this one
+# only packages locally so a fork can have its own binary.
+name: build personal
+
+on:
+  push:
+    branches: [personal]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-personal-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # The whole target/, like upstream's release.yml: the vendored crates
+      # (gpui-kit, taffy, ghostty) are the slow part and Rust caches skip them.
+      - name: Restore build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: personal-v1-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/**', 'crates/**') }}
+          restore-keys: personal-v1-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-
+      # bindgen's libclang: the runner image's LLVM.
+      - name: Windows build dependencies
+        run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+      - name: Keep unchanged sources fresh
+        run: scripts/ci-sources restore
+      # scripts/package sets HERDR_APP_RELEASE=1: the build updates itself, but
+      # only from HERDR_RELEASES_URL, which a fork leaves unset (src/update.rs),
+      # so it behaves like a build from source: no update prompt.
+      - name: Build and pack
+        run: scripts/package x86_64-pc-windows-msvc
+      - name: Save build cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: herdr-app-windows-x86_64-personal
+          path: dist/herdr-app-windows-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 30

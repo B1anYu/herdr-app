@@ -72,7 +72,13 @@ struct Grid {
     /// Each row's drawing by position, kept while the row is the same (`Rc`).
     painted: Vec<(Rc<Vec<vt::Cell>>, Vec<RowOp>)>,
     /// The font size, cell size, font and fonts loaded the drawings were built with.
-    painted_with: (u32, Size<Pixels>, String, u64),
+    painted_with: (u32, Size<Pixels>, String, u64, u32),
+    // personal: cursor blinking (upstream draws a steady cursor).
+    /// When the blink phase started, whether it starts shown, and the cell the
+    /// cursor was in then: moving the cursor starts the phase over, shown.
+    blink: Option<(Instant, bool, (u16, u16))>,
+    /// The cursor the last frame drew blinks, so a timer keeps it going.
+    blinks: bool,
 }
 
 pub struct TerminalView {
@@ -101,6 +107,8 @@ pub struct TerminalView {
     /// Scrolled this gesture, in lines, toward the next whole one.
     scrolled: f32,
     _reader: Option<Task<()>>,
+    /// personal: a blink redraw is already scheduled.
+    blinking_timer: bool,
 }
 
 thread_local! {
@@ -110,6 +118,9 @@ thread_local! {
 
 /// The window's frame number, counted where the window renders.
 static FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// personal: how long each half of the cursor's blink lasts, as in Ghostty.
+const BLINK_PERIOD: Duration = Duration::from_millis(530);
 
 pub fn next_frame() {
     FRAME.fetch_add(1, Ordering::Relaxed);
@@ -201,7 +212,9 @@ impl TerminalView {
                 marked: None,
                 cursor_at: None,
                 painted: Vec::new(),
-                painted_with: (0, Size::default(), String::new(), 0),
+                painted_with: (0, Size::default(), String::new(), 0, 0),
+                blink: None,
+                blinks: false,
             })),
             focus: cx.focus_handle(),
             was_focused: false,
@@ -209,6 +222,7 @@ impl TerminalView {
             typed_at: Cell::new(None),
             scrolled: 0.0,
             _reader: None,
+            blinking_timer: false,
         };
         view.connect(core, false, cx);
         view
@@ -987,7 +1001,8 @@ fn cell_font(bold: bool, italic: bool) -> Font {
     let mut f = font(crate::settings::terminal_font());
     // Ligatures merge several cells into one glyph, which breaks the grid.
     f.features = FontFeatures(std::sync::Arc::new(vec![("calt".into(), 0), ("liga".into(), 0), ("dlig".into(), 0)]));
-    f.weight = if bold { FontWeight::BOLD } else { FontWeight::MEDIUM };
+    // personal: settings.json's font_weight (upstream always draws MEDIUM here, #134).
+    f.weight = if bold { FontWeight::BOLD } else { FontWeight(crate::settings::font_weight()) };
     f.style = if italic { FontStyle::Italic } else { FontStyle::Normal };
     f
 }
@@ -1146,6 +1161,21 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     g.images.retain(|k, _| keep.contains(k));
     let link_spans = g.link_spans.clone();
     let marked = g.marked.clone();
+    // personal: the cursor's blink phase, and whether this frame's cursor blinks
+    // (the view's timer redraws while it does).
+    let blinking = frame.cursor.is_some_and(|c| c.blinking) && focused;
+    g.blinks = blinking;
+    let blink_shown = !blinking || {
+        let cell = frame.cursor.map(|c| (c.x, c.y)).unwrap_or_default();
+        let (since, shown) = match g.blink {
+            // A cursor that moved, or started blinking, starts over shown.
+            Some((_, _, at)) if at != cell => (Instant::now(), true),
+            Some((since, shown, _)) if since.elapsed() < BLINK_PERIOD => (since, shown),
+            _ => (Instant::now(), !g.blink.is_some_and(|(_, shown, _)| shown)),
+        };
+        g.blink = Some((since, shown, cell));
+        shown
+    };
     drop(g);
 
     window.paint_quad(fill(bounds, hsla(frame.bg).opacity(crate::settings::get().terminal_opacity)));
@@ -1168,7 +1198,8 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     // Each row's drawing is built once and painted again while the row is the
     // same (`Vt::frame` keeps a row libghostty didn't change): an agent's spinner
     // line rebuilds one row, not the whole screen.
-    let with = (crate::settings::font_size().to_bits(), cell, crate::settings::terminal_font(), crate::settings::fonts_added());
+    // personal: the weight is part of the key, so changing font_weight redraws.
+    let with = (crate::settings::font_size().to_bits(), cell, crate::settings::terminal_font(), crate::settings::fonts_added(), crate::settings::font_weight().to_bits());
     // When every row changed (output scrolling), nothing is kept: the next
     // frame would find none of them the same.
     let mut painted = std::mem::take(&mut grid.borrow_mut().painted);
@@ -1229,6 +1260,11 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         let w = cell.width * if wide { 2.0 } else { 1.0 };
         let color = hsla(cur.color);
         let p = at(x, y);
+        // personal: a blinking cursor is drawn on the on half of its cycle.
+        // Only a focused terminal blinks, so the pane with the keyboard moves.
+        if cur.blinking && focused && !blink_shown {
+            return;
+        }
         match (focused, cur.shape) {
             (true, CursorShape::Block) => {
                 window.paint_quad(fill(snap_box(Bounds::new(p, size(w, cell.height))), color));
@@ -1335,10 +1371,25 @@ impl Render for TerminalView {
         let focused = self.focus.is_focused(window);
         if focused != self.was_focused {
             self.was_focused = focused;
+            // personal: a cursor that starts or stops blinking starts over shown.
+            self.grid.borrow_mut().blink = None;
             let g = self.grid.borrow();
             if let Some(ch) = g.channel {
                 g.core.focus(ch, focused);
             }
+        }
+        // personal: while the cursor blinks (the last frame's did), redraw once
+        // per half cycle. The timer stops itself when the cursor stops blinking.
+        if self.grid.borrow().blinks && !self.blinking_timer && self.shown_in.get() == FRAME.load(Ordering::Relaxed) {
+            self.blinking_timer = true;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(BLINK_PERIOD).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.blinking_timer = false;
+                    cx.notify();
+                });
+            })
+            .detach();
         }
         let cell = cell_size(window);
         let hover = self.grid.borrow().hover;

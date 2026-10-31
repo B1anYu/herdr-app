@@ -381,6 +381,17 @@ pub struct Person {
     /// The panels' font (their sizes follow zoom).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_font: Option<String>,
+    // personal: terminal text weight (upstream always draws normal text at Medium).
+    /// Terminal text weight, 100..900. Absent: Medium (500), as upstream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_weight: Option<u16>,
+    // personal: the cursor's shape and blinking.
+    /// The terminal cursor: a bar, block, underline or hollow block. Absent: block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_style: Option<CursorStyle>,
+    /// Whether the terminal cursor blinks. Absent: it doesn't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_blink: Option<bool>,
     /// Anonymous usage data (telemetry.rs). On unless set to false.
     #[serde(skip_serializing_if = "is_true")]
     pub telemetry: bool,
@@ -435,6 +446,17 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+/// personal: settings.json's `cursor_style`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorStyle {
+    Bar,
+    #[default]
+    Block,
+    Underline,
+    Hollow,
+}
+
 impl Default for Person {
     fn default() -> Self {
         Person {
@@ -444,6 +466,9 @@ impl Default for Person {
             font: None,
             font_size: None,
             ui_font: None,
+            font_weight: None,
+            cursor_style: None,
+            cursor_blink: None,
             telemetry: true,
             clipboard_write: true,
             minimum_contrast: 1.0,
@@ -462,6 +487,10 @@ impl Default for Person {
 pub struct Settings {
     pub font_family: String,
     pub font_size: f32,
+    // personal: terminal text weight and the cursor's shape and blinking.
+    pub font_weight: f32,
+    pub cursor_style: CursorStyle,
+    pub cursor_blink: bool,
     pub ui_font_family: String,
     pub ui_font_size: f32,
     /// How big the whole app is drawn (1 = as designed). The zoom keys change it.
@@ -509,6 +538,9 @@ impl Default for Settings {
         Settings {
             font_family: DEFAULT_FONT.into(),
             font_size: 14.0,
+            font_weight: 500.0,
+            cursor_style: CursorStyle::Block,
+            cursor_blink: false,
             ui_font_family: "Geist".into(),
             ui_font_size: 13.0,
             zoom: 1.0,
@@ -547,6 +579,9 @@ impl Settings {
             font_size: look.font_size.or(person.font_size).unwrap_or(d.font_size),
             ui_font_family: look.ui_font.clone().or(person.ui_font.clone()).unwrap_or(d.ui_font_family),
             ui_font_size: d.ui_font_size,
+            font_weight: person.font_weight.map_or(d.font_weight, |w| f32::from(w.clamp(100, 900))),
+            cursor_style: person.cursor_style.unwrap_or(d.cursor_style),
+            cursor_blink: person.cursor_blink.unwrap_or(d.cursor_blink),
             zoom: person.zoom,
             theme: if dark { theme_dark.clone() } else { theme_light.clone() },
             theme_light,
@@ -746,6 +781,21 @@ pub fn font_size() -> f32 {
 
 pub fn ui_font_size() -> f32 {
     get().ui_font_size * zoom()
+}
+
+/// personal: normal terminal text's weight (bold text stays bold).
+pub fn font_weight() -> f32 {
+    get().font_weight
+}
+
+/// personal: the cursor the terminal draws when the program doesn't pick one.
+pub fn cursor_style() -> CursorStyle {
+    get().cursor_style
+}
+
+/// personal: whether that cursor blinks.
+pub fn cursor_blink() -> bool {
+    get().cursor_blink
 }
 
 /// Font families on this machine (the bundled ones and the home's included).

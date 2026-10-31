@@ -100,6 +100,8 @@ pub struct Cursor {
     pub y: u16,
     pub shape: CursorShape,
     pub color: Rgb,
+    /// personal: the terminal's mode 12, and the default from settings.json.
+    pub blinking: bool,
 }
 
 pub struct Frame {
@@ -682,6 +684,8 @@ impl Vt {
                 win32: Default::default(),
             };
             vt.apply_theme();
+            // personal: before the program has said anything, this is the cursor.
+            vt.apply_cursor_defaults();
             vt
         }
     }
@@ -693,6 +697,23 @@ impl Vt {
             self.apply_theme();
             // Rows carry the theme's own colors too (the selection's).
             self.seen.clear();
+        }
+        // personal: a new cursor_style or cursor_blink applies without a restart.
+        self.apply_cursor_defaults();
+    }
+
+    /// personal: settings.json's cursor_style and cursor_blink, for DECSCUSR reset.
+    pub fn apply_cursor_defaults(&self) {
+        let style = match crate::settings::cursor_style() {
+            crate::settings::CursorStyle::Bar => GHOSTTY_TERMINAL_CURSOR_STYLE_BAR,
+            crate::settings::CursorStyle::Block => GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK,
+            crate::settings::CursorStyle::Underline => GHOSTTY_TERMINAL_CURSOR_STYLE_UNDERLINE,
+            crate::settings::CursorStyle::Hollow => GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK_HOLLOW,
+        };
+        let blink = crate::settings::cursor_blink();
+        unsafe {
+            ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_STYLE, &style as *const _ as *const c_void);
+            ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK, &blink as *const _ as *const c_void);
         }
     }
 
@@ -1366,6 +1387,7 @@ impl Vt {
                     _ => CursorShape::Block,
                 },
                 color: if colors.cursor_has_value { colors.cursor.into() } else { fg_default },
+                blinking: cur.blinking,
             });
 
             self.drawn = self.drawable();
