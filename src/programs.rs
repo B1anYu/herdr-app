@@ -352,6 +352,48 @@ fn shown(key: &str, e: &Entry, name: Option<&str>, shell: bool, agent: bool) -> 
     })
 }
 
+/// `personal:` Give an agent a conversation id of our choosing, and return
+/// the command that resumes it. Only Claude Code takes `--session-id` today;
+/// a command already told how to continue is left alone.
+pub fn resume(cmd: &mut Vec<String>) -> Option<Vec<String>> {
+    if cmd.is_empty() || TABLE.with(|t| resolve(&t.borrow(), None, cmd)["key"] != "claude") {
+        return None;
+    }
+    const CONTINUES: &[&str] = &["--session-id", "--resume", "--continue", "-c", "--from-pr", "--fork-session"];
+    if cmd.iter().any(|a| CONTINUES.contains(&a.as_str())) {
+        return None;
+    }
+    let id = uuid();
+    let exe = cmd[0].clone();
+    cmd.extend(["--session-id".to_owned(), id.clone()]);
+    Some(vec![exe, "--resume".to_owned(), id])
+}
+
+/// A version-4 UUID from the standard library alone (the app carries no RNG).
+fn uuid() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let mut a = std::collections::hash_map::RandomState::new().build_hasher();
+    a.write_u128(now);
+    a.write_u32(std::process::id());
+    let x = a.finish();
+    let mut b = std::collections::hash_map::RandomState::new().build_hasher();
+    b.write_u64(x);
+    b.write_u128(now.rotate_left(17));
+    let y = b.finish();
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (x >> 32) as u32,
+        ((x >> 16) & 0xffff) as u16,
+        (x & 0x0fff) as u16,
+        (((y >> 48) & 0x3fff) | 0x8000) as u16,
+        y & 0x0000_ffff_ffff_ffff
+    )
+}
+
 /// A color for a program nobody listed, the same every time.
 fn hash_color(s: &str) -> &'static str {
     const PALETTE: [&str; 8] = ["#6d5bd0", "#2f80ed", "#0f9d8a", "#d9822b", "#c2417d", "#3a7d44", "#8a5a44", "#4e5d94"];
@@ -393,6 +435,28 @@ mod tests {
         let commands = ["cmd.exe".into(), "herdr_missing_agent_440".into()];
         let result = crate::mods::run_blocking("powershell.exe", &installed_powershell(&commands), None, std::time::Duration::from_secs(30));
         assert_eq!(installed_result(&commands, result).unwrap(), ["cmd.exe"]);
+    }
+
+    #[test]
+    fn resume_gives_claude_a_session_id_and_the_command_that_reopens_it() {
+        let mut cmd = vec!["claude".into(), "--dangerously-skip-permissions".into()];
+        let restore = resume(&mut cmd).expect("claude takes a session id");
+        assert_eq!(cmd[..2], ["claude", "--dangerously-skip-permissions"]);
+        assert_eq!(cmd[cmd.len() - 2], "--session-id");
+        let id = cmd.last().unwrap().clone();
+        assert_eq!(id.len(), 36, "{id}");
+        assert_eq!(restore, vec!["claude", "--resume", id]);
+        assert_eq!(resume(&mut cmd), None, "not twice");
+    }
+
+    #[test]
+    fn resume_leaves_other_programs_and_continuing_commands_alone() {
+        let mut other = vec!["codex".into()];
+        assert_eq!(resume(&mut other), None);
+        let mut continuing = vec!["claude".into(), "--continue".into()];
+        assert_eq!(resume(&mut continuing), None);
+        let mut resumed = vec!["claude".into(), "--resume".into(), "x".into()];
+        assert_eq!(resume(&mut resumed), None);
     }
 
     #[test]

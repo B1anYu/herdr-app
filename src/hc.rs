@@ -463,12 +463,16 @@ impl Core {
 
     /// Starts a program in a new core terminal and returns its address (`tN`).
     /// Starts a terminal, here or on another machine (`on`: its name in `hc machine ls`).
-    pub fn run(&self, argv: Vec<String>, cwd: Option<String>, labels: Value, on: Option<&str>, size: Option<(u16, u16)>, display: Value) -> Result<String> {
+    pub fn run(&self, argv: Vec<String>, cwd: Option<String>, labels: Value, on: Option<&str>, size: Option<(u16, u16)>, display: Value, restore: Option<Vec<String>>) -> Result<String> {
         let env = json!({"TERM": "xterm-256color", "COLORTERM": "truecolor", "TERM_PROGRAM": "herdr"});
         let mut params = json!({"argv": argv, "cwd": cwd, "env": env, "labels": labels, "on": on, "keep": true, "display": display});
         // Released cores ignore unknown parameters, including when forwarding to another machine.
         if let Some((cols, rows)) = size {
             params["size"] = json!({"cols": cols, "rows": rows});
+        }
+        // `personal:` A conversation to come back to after a reboot.
+        if let Some(restore) = restore {
+            params["restore"] = json!(restore);
         }
         let r = self.call("terminal.run", params)?;
         r.get("address")
@@ -730,7 +734,7 @@ mod tests {
             routes.lock().unwrap().replies.remove(&request["id"].as_u64().unwrap()).unwrap()
                 .send(Ok(json!({"address": "t1"}))).unwrap();
         });
-        assert_eq!(core.run(vec![], None, json!({}), None, Some((80, 24)), display).unwrap(), "t1");
+        assert_eq!(core.run(vec![], None, json!({}), None, Some((80, 24)), display, None).unwrap(), "t1");
         peer.join().unwrap();
     }
 

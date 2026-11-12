@@ -2387,14 +2387,14 @@ impl AppWindow {
     /// Starts a terminal for `space`, on `on` (another machine) or here. An
     /// empty `cwd`: the machine's home. With no argv, that machine's core
     /// picks its own shell.
-    fn spawn(&mut self, argv: Option<Vec<String>>, cwd: String, follow: bool, space: &str, ctx: &str, on: Option<&str>, size: Option<(u16, u16)>, window: &Window) -> Result<(String, String), String> {
+    fn spawn(&mut self, argv: Option<Vec<String>>, cwd: String, follow: bool, space: &str, ctx: &str, on: Option<&str>, size: Option<(u16, u16)>, restore: Option<Vec<String>>, window: &Window) -> Result<(String, String), String> {
         let argv = argv.unwrap_or_default();
         self.require_document(on)?;
         let labels = json!({ "herdr.space": crate::mirror::local(space, on), "herdr.tab": crate::mirror::local(ctx, on), "herdr.seen": "0" });
-        let (addr, cwd) = run_following_folder(cwd, follow, on, |cwd| match self.core.run(argv.clone(), cwd.clone(), labels.clone(), on, size, crate::terminal::initial_display(window)) {
+        let (addr, cwd) = run_following_folder(cwd, follow, on, |cwd| match self.core.run(argv.clone(), cwd.clone(), labels.clone(), on, size, crate::terminal::initial_display(window), restore.clone()) {
             // An agent on a machine without `sh` (Windows): in its PowerShell instead.
             Err(e) if on.is_some() && argv.first().map(String::as_str) == Some("sh") && format!("{e:#}").contains("not found") => {
-                self.core.run(Self::powershell_argv(&argv), cwd, labels.clone(), on, size, crate::terminal::initial_display(window))
+                self.core.run(Self::powershell_argv(&argv), cwd, labels.clone(), on, size, crate::terminal::initial_display(window), restore.clone())
             }
             r => r,
         })
@@ -2416,10 +2416,13 @@ impl AppWindow {
 
     /// An agent with its first message, in a shell that stays when the agent exits
     /// (on another machine: that machine's shell).
-    fn agent_argv(argv: Option<Vec<String>>, task: Option<&str>, on: Option<&str>) -> Option<Vec<String>> {
+    fn agent_argv(
+        argv: Option<Vec<String>>,
+        task: Option<&str>,
+        on: Option<&str>,
+    ) -> Option<(Vec<String>, Option<Vec<String>>)> {
         let task = task.map(str::trim).filter(|t| !t.is_empty());
-        argv.filter(|a| !a.is_empty()).map(|mut cmd| {
-            cmd.extend(task.map(str::to_owned));
+        let wrap = |cmd: Vec<String>| -> Vec<String> {
             if on.is_some() {
                 return crate::remote_shell::launch(cmd);
             }
@@ -2430,6 +2433,13 @@ impl AppWindow {
             }
             // macOS terminal sessions load login profiles (including Homebrew's PATH).
             unix_agent_argv(sh, cmd, cfg!(target_os = "macos"))
+        };
+        argv.filter(|a| !a.is_empty()).map(|mut cmd| {
+            // `personal:` Pick the agent conversation id now, so keep can come
+            // back to this exact conversation after a reboot.
+            let restore = crate::programs::resume(&mut cmd).map(|resume| wrap(resume));
+            cmd.extend(task.map(str::to_owned));
+            (wrap(cmd), restore)
         })
     }
 
@@ -2445,7 +2455,11 @@ impl AppWindow {
         let folder = folder.or_else(here).unwrap_or_else(|| if on.is_some() { String::new() } else { home() });
         let (space, ctx, pane) = (self.model.fresh_id_on("sp", on), self.model.fresh_id_on("tb", on), self.model.fresh_id_on("p", on));
         let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
-        let (addr, folder) = self.spawn(Self::agent_argv(argv.clone(), task, on).or(argv), folder, follow, &space, &ctx, on, size, window)?;
+        let (argv, restore) = match Self::agent_argv(argv.clone(), task, on) {
+            Some((argv, restore)) => (Some(argv), restore),
+            None => (argv, None),
+        };
+        let (addr, folder) = self.spawn(argv, folder, follow, &space, &ctx, on, size, restore, window)?;
         let ctx_name = ctx_name.map(str::trim).unwrap_or_default();
         self.model.add_space(&space, name.trim(), &folder, Tab::new(&ctx, ctx_name, &pane, &addr));
         if let Some(p) = self.model.space_mut(&space) {
@@ -2465,7 +2479,11 @@ impl AppWindow {
         let on = self.machine_of(&space);
         let (ctx, pane) = (self.model.fresh_id_on("tb", on.as_deref()), self.model.fresh_id_on("p", on.as_deref()));
         let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
-        let (addr, _) = self.spawn(Self::agent_argv(argv.clone(), task, on.as_deref()).or(argv), folder, follow, &space, &ctx, on.as_deref(), size, window)?;
+        let (argv, restore) = match Self::agent_argv(argv.clone(), task, on.as_deref()) {
+            Some((argv, restore)) => (Some(argv), restore),
+            None => (argv, None),
+        };
+        let (addr, _) = self.spawn(argv, folder, follow, &space, &ctx, on.as_deref(), size, restore, window)?;
         self.model.add_tab(&space, Tab::new(&ctx, name.trim(), &pane, &addr));
         self.model.active = Some(space.clone());
         Ok(json!({ "space": space, "tab": ctx, "terminal": addr }))
@@ -2502,7 +2520,7 @@ impl AppWindow {
         root.split(&target, axis, Node::block(new.clone(), Content::Terminal { terminal: String::new() }), "initial-size".into());
         let size = self.model.active_tab().filter(|tab| tab.id == ctx)
             .and_then(|_| self.initial_size(&root, &new, window));
-        let (addr, _) = self.spawn(argv, cwd, follow, &space, &ctx, on.as_deref(), size, window)?;
+        let (addr, _) = self.spawn(argv, cwd, follow, &space, &ctx, on.as_deref(), size, None, window)?;
         self.model.split(&target, axis, &new, &addr);
         Ok(json!({ "pane": new, "terminal": addr }))
     }
