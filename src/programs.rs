@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(cmd[cmd.len() - 2], "--session-id");
         let id = cmd.last().unwrap().clone();
         assert_eq!(id.len(), 36, "{id}");
-        assert_eq!(restore, vec!["claude", "--resume", id]);
+        assert_eq!(restore, vec!["claude".to_string(), "--resume".to_string(), id]);
         assert_eq!(resume(&mut cmd), None, "not twice");
     }
 
