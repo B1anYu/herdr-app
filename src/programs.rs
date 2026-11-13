@@ -359,29 +359,38 @@ pub fn resume(cmd: &mut Vec<String>) -> Option<Vec<String>> {
     if cmd.is_empty() || TABLE.with(|t| resolve(&t.borrow(), None, cmd)["key"] != "claude") {
         return None;
     }
-    const CONTINUES: &[&str] = &["--session-id", "--resume", "--continue", "-c", "--from-pr", "--fork-session"];
+    const CONTINUES: &[&str] = &["--session-id", "--resume", "-r", "--continue", "-c", "--from-pr", "--fork-session"];
     if cmd.iter().any(|a| CONTINUES.contains(&a.as_str())) {
         return None;
     }
     let id = uuid();
     let exe = cmd[0].clone();
     cmd.extend(["--session-id".to_owned(), id.clone()]);
-    Some(vec![exe, "--resume".to_owned(), id])
+    let mut restore = vec![exe, "--resume".to_owned(), id];
+    if cmd.iter().any(|a| a == "--dangerously-skip-permissions") {
+        restore.push("--dangerously-skip-permissions".to_owned());
+    }
+    Some(restore)
 }
 
 /// A version-4 UUID from the standard library alone (the app carries no RNG).
 fn uuid() -> String {
     use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let mut a = std::collections::hash_map::RandomState::new().build_hasher();
     a.write_u128(now);
+    a.write_u64(seq);
     a.write_u32(std::process::id());
     let x = a.finish();
     let mut b = std::collections::hash_map::RandomState::new().build_hasher();
     b.write_u64(x);
+    b.write_u64(seq.rotate_left(31));
     b.write_u128(now.rotate_left(17));
     let y = b.finish();
     format!(
@@ -445,7 +454,15 @@ mod tests {
         assert_eq!(cmd[cmd.len() - 2], "--session-id");
         let id = cmd.last().unwrap().clone();
         assert_eq!(id.len(), 36, "{id}");
-        assert_eq!(restore, vec!["claude".to_string(), "--resume".to_string(), id]);
+        assert_eq!(
+            restore,
+            vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                id,
+                "--dangerously-skip-permissions".to_string()
+            ]
+        );
         assert_eq!(resume(&mut cmd), None, "not twice");
     }
 
