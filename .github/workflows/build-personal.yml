@@ -55,11 +55,19 @@ jobs:
         run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
       - name: Keep unchanged sources fresh
         run: scripts/ci-sources restore
-      # scripts/package sets HERDR_APP_RELEASE=1: the build updates itself, but
-      # only from HERDR_RELEASES_URL, which a fork leaves unset (src/update.rs),
-      # so it behaves like a build from source: no update prompt.
+      # Build without HERDR_APP_RELEASE (which scripts/package sets): src/update.rs
+      # defaults to releases.herdr.dev whenever HERDR_APP_RELEASE is set, which
+      # would overwrite both this personal app and our custom herdr-core.
       - name: Build and pack
-        run: scripts/package x86_64-pc-windows-msvc
+        run: |
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          work=$(mktemp -d)
+          mkdir -p "$work/herdr-app" dist
+          cp target/x86_64-pc-windows-msvc/release/herdr-app.exe "$work/herdr-app/"
+          cp assets/icons/herdr-ui-icon-clean.svg "$work/herdr-app/herdr-app.svg"
+          cp LICENSE THIRD-PARTY-NOTICES "$work/herdr-app/"
+          tar -czf dist/herdr-app-windows-x86_64.tar.gz -C "$work" herdr-app
+          rm -rf "$work"
       - name: Save build cache
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
