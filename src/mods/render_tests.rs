@@ -502,7 +502,7 @@ fn windows_tab_buttons_use_matching_vector_icons(cx: &mut TestAppContext) {
 fn font_pickers_contain_scroll_on_the_wrapper(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let staged = Staged::new();
-    for which in ["font", "ui_font"] {
+    for which in ["font", "font_fallbacks", "ui_font"] {
         let mut p = props();
         p["section"] = json!("look");
         let tree = describe(
@@ -513,6 +513,7 @@ fn font_pickers_contain_scroll_on_the_wrapper(cx: &mut TestAppContext) {
         assert!(scroll.contains("overflow_y_scrollbar"), "{tree}");
         assert!(!scroll.contains("on_scroll_wheel"), "the native scroller must receive the event: {tree}");
         assert_eq!(tree.matches("on_scroll_wheel").count(), 1, "the wrapper must stop scroll chaining: {tree}");
+        assert!(tree.contains("st-fw-400") && tree.contains("st-cs-bar") && tree.contains("st-cursor-blink"), "{tree}");
     }
 }
 

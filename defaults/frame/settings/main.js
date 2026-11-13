@@ -21,6 +21,19 @@ const APPEARANCES = [
   ["light", "Light"],
   ["dark", "Dark"],
 ];
+const FONT_WEIGHTS = [
+  [300, "Light"],
+  [400, "Regular"],
+  [500, "Medium"],
+  [600, "SemiBold"],
+  [700, "Bold"],
+];
+const CURSOR_STYLES = [
+  ["bar", "Bar"],
+  ["block", "Block"],
+  ["underline", "Underline"],
+  ["hollow", "Hollow"],
+];
 
 // What the app uses when settings.json names no font (settings.rs).
 const DEFAULT_FONT = "JetBrains Mono";
@@ -385,8 +398,9 @@ export default class Settings extends View {
   }
 
   // The font in use, written in itself; a click opens the list.
-  fontButton(t, which, family, def) {
+  fontButton(t, which, family, def, displayLabel = null) {
     const open = this.picking === which;
+    const shown = displayLabel ?? family;
     const trigger = div()
       .id(`st-f-${which}`)
       .w(220)
@@ -406,7 +420,14 @@ export default class Settings extends View {
         else this.handle.focus();
         cx.notify();
       })
-      .child(div().font_family(family).text_size(13.5).text_color(t.foreground).child(family));
+      .child(
+        div()
+          .when(Boolean(family), (el) => el.font_family(family))
+          .text_size(13.5)
+          .text_color(family ? t.foreground : t.muted)
+          .truncate()
+          .child(shown),
+      );
     return Popup.new(`st-fp-${which}`, trigger)
       .when(open, (el) => el.content(this.fontList(t, which, def)));
   }
@@ -414,9 +435,11 @@ export default class Settings extends View {
   fontList(t, which, def) {
     const q = this.filter.toLowerCase();
     const matches = fonts().filter((f) => f.toLowerCase().includes(q)).slice(0, 200);
+    const isFallback = which === "font_fallbacks";
     const choose = (name, cx) => {
       this.change((p) => {
         if (name === null) delete p[which];
+        else if (isFallback) p[which] = [name];
         else p[which] = name;
       }, cx);
       this.picking = null;
@@ -432,7 +455,13 @@ export default class Settings extends View {
         .cursor_pointer()
         .hover((s) => s.bg(t.hover))
         .on_click(onClick)
-        .child(div().font_family(family).text_size(13.5).text_color(t.foreground).child(label));
+        .child(
+          div()
+            .when(Boolean(family), (el) => el.font_family(family))
+            .text_size(13.5)
+            .text_color(t.foreground)
+            .child(label),
+        );
     return v_flex()
       .id(`st-font-list-${which}`)
       .w(360)
@@ -462,9 +491,66 @@ export default class Settings extends View {
           .h(200)
           .p(4)
           .overflow_y_scrollbar()
-          .when(!q, (el) => el.child(item(`st-fd-${which}`, `Default (${def})`, def, (_e, cx) => choose(null, cx))))
+          .when(!q, (el) =>
+            el.child(
+              item(
+                `st-fd-${which}`,
+                isFallback ? "System default" : `Default (${def})`,
+                isFallback ? null : def,
+                (_e, cx) => choose(null, cx),
+              ),
+            ),
+          )
           .children(matches.map((f, i) => item(`st-fi-${which}-${i}`, f, f, (_e, cx) => choose(f, cx)))),
       );
+  }
+
+  pillGroup(t, prefix, choices, current, onPick) {
+    return h_flex()
+      .p(2)
+      .gap(2)
+      .rounded(8)
+      .border_1()
+      .border_color(t.border)
+      .bg(t.background)
+      .children(
+        choices.map(([value, label]) => {
+          const on = current === value;
+          return div()
+            .id(`${prefix}-${value}`)
+            .px(11)
+            .py(4)
+            .rounded(6)
+            .text_size(13)
+            .cursor_pointer()
+            .when(on, (el) => el.bg(t.raised).text_color(t.foreground).border_1().border_color(t.border))
+            .when(!on, (el) => el.text_color(t.muted).hover((s) => s.text_color(t.foreground)))
+            .on_click((_e, cx) => onPick(value, cx))
+            .child(label);
+        }),
+      );
+  }
+
+  fontWeightPicker(t, now) {
+    const rounded = Math.round(now);
+    const choices = FONT_WEIGHTS.some(([w]) => w === rounded)
+      ? FONT_WEIGHTS
+      : [...FONT_WEIGHTS, [rounded, `${rounded}`]].sort((a, b) => a[0] - b[0]);
+    return this.pillGroup(t, "st-fw", choices, rounded, (value, cx) =>
+      this.change((p) => {
+        if (value === 500) delete p.font_weight;
+        else p.font_weight = value;
+      }, cx),
+    );
+  }
+
+  cursorStylePicker(t, now) {
+    return this.pillGroup(t, "st-cs", CURSOR_STYLES, now, (value, cx) =>
+      this.change((p) => {
+        if (value === "block") delete p.cursor_style;
+        else p.cursor_style = value;
+      }, cx),
+    );
   }
 
   look(t, cx) {
@@ -515,7 +601,51 @@ export default class Settings extends View {
         ),
       )
       .child(fontRow("font", "font_size", "Terminal font", s.font_family, DEFAULT_FONT, s.font_size))
-      .child(fontRow("ui_font", null, "Interface font", s.ui_font_family, DEFAULT_UI_FONT));
+      .child(
+        (() => {
+          const fallbacks = Array.isArray(s.font_fallbacks) ? s.font_fallbacks : [];
+          const primary = fallbacks[0] ?? null;
+          const label = !primary ? "System default" : fallbacks.length > 1 ? `${primary} +${fallbacks.length - 1}` : primary;
+          return this.row(
+            t,
+            "Terminal fallback font",
+            "Used for characters missing from the terminal font (such as CJK or symbols).",
+            this.fontButton(t, "font_fallbacks", primary, "", label),
+          );
+        })(),
+      )
+      .child(
+        this.row(
+          t,
+          "Terminal font weight",
+          "Regular text weight in terminals (bold stays bold).",
+          this.fontWeightPicker(t, Number(s.font_weight ?? 500)),
+        ),
+      )
+      .child(fontRow("ui_font", null, "Interface font", s.ui_font_family, DEFAULT_UI_FONT))
+      .child(div().h(18))
+      .child(this.heading(t, "Cursor"))
+      .child(
+        this.row(
+          t,
+          "Cursor style",
+          "Shown when the terminal program hasn't chosen its own cursor.",
+          this.cursorStylePicker(t, String(s.cursor_style ?? "block")),
+        ),
+      )
+      .child(
+        this.row(
+          t,
+          "Cursor blink",
+          "Blink the cursor in the focused terminal.",
+          this.toggle(t, "st-cursor-blink", Boolean(s.cursor_blink), (_e, cx) =>
+            this.change((q) => {
+              if (q.cursor_blink) delete q.cursor_blink;
+              else q.cursor_blink = true;
+            }, cx),
+          ),
+        ),
+      );
   }
 
   keyboard(t) {

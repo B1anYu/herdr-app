@@ -101,6 +101,9 @@ struct Grid {
     /// Text an input method is still composing ("nihao" before "\u{4f60}\u{597d}"),
     /// drawn at the cursor; the program sees only the finished text.
     marked: Option<String>,
+    /// personal: UTF-16 caret offset inside `marked` from the input method, so
+    /// the thin composition caret bar is drawn at the insertion point.
+    marked_caret: Option<usize>,
     /// The cursor's cell in window coordinates, from the last paint: where the
     /// input method puts its candidate window.
     cursor_at: Option<Bounds<Pixels>>,
@@ -110,12 +113,12 @@ struct Grid {
     track: Option<Bounds<Pixels>>,
     /// Each row's drawing by position, kept while the row is the same (`Rc`).
     painted: Vec<(Rc<Vec<vt::Cell>>, Vec<RowOp>, Option<usize>)>,
-    /// Font size, cell size, font, loaded fonts, ligature setting and weight used to draw.
-    painted_with: (u32, Size<Pixels>, String, u64, bool, u32),
+    /// Font size, cell size, font, fallbacks, loaded fonts, ligatures and weight used to draw.
+    painted_with: (u32, Size<Pixels>, String, Vec<String>, u64, bool, u32),
     // personal: cursor blinking (upstream draws a steady cursor).
-    /// When the blink phase started, whether it starts shown, and the cell the
-    /// cursor was in then: moving the cursor starts the phase over, shown.
-    blink: Option<(Instant, bool, (u16, u16))>,
+    /// When the blink phase started, whether it starts shown, and the cell +
+    /// IME caret position then: moving the cursor starts the phase over, shown.
+    blink: Option<(Instant, bool, (u16, u16, usize))>,
     /// The cursor the last frame drew blinks, so a timer keeps it going.
     blinks: bool,
 }
@@ -297,11 +300,12 @@ impl TerminalView {
                 hover: None,
                 link_spans: Vec::new(),
                 marked: None,
+                marked_caret: None,
                 cursor_at: None,
                 thumb: None,
                 track: None,
                 painted: Vec::new(),
-                painted_with: (0, Size::default(), String::new(), 0, false, 0),
+                painted_with: (0, Size::default(), String::new(), Vec::new(), 0, false, 0),
                 blink: None,
                 blinks: false,
             })),
@@ -1570,10 +1574,26 @@ fn ligature_features(enabled: bool) -> FontFeatures {
 fn cell_font(bold: bool, italic: bool) -> Font {
     let mut f = font(crate::settings::terminal_font());
     f.features = ligature_features(false);
-    // personal: settings.json's font_weight (upstream always draws MEDIUM here, #134).
+    // personal: settings.json's font_weight and font_fallbacks.
     f.weight = if bold { FontWeight::BOLD } else { FontWeight(crate::settings::font_weight()) };
+    let fallbacks = crate::settings::font_fallbacks();
+    if !fallbacks.is_empty() {
+        f.fallbacks = Some(gpui::FontFallbacks::from_fonts(fallbacks));
+    }
     f.style = if italic { FontStyle::Italic } else { FontStyle::Normal };
     f
+}
+
+/// personal: UTF-16 code-unit index (as GPUI's IME APIs report) to UTF-8 byte offset.
+fn utf16_offset_to_utf8(s: &str, target_u16: usize) -> usize {
+    let mut u16_pos = 0;
+    for (byte_idx, ch) in s.char_indices() {
+        if u16_pos >= target_u16 {
+            return byte_idx;
+        }
+        u16_pos += ch.len_utf16();
+    }
+    s.len()
 }
 
 // JetBrains Mono joins punctuation, so ordinary ASCII output can keep using
@@ -1862,20 +1882,27 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     }
     g.images.retain(|k, _| keep.contains(k));
     let link_spans = g.link_spans.clone();
-    let marked = g.marked.clone();
+    let marked = g.marked.clone().filter(|t| !t.is_empty());
+    let marked_caret = g.marked_caret;
     // personal: the cursor's blink phase, and whether this frame's cursor blinks
-    // (the view's timer redraws while it does).
-    let blinking = frame.cursor.is_some_and(|c| c.blinking) && focused;
+    // (the view's timer redraws while it does). During IME composition, only the
+    // thin composition caret blinks; the preedit string itself never blinks.
+    let ime_active = marked.is_some() && frame.cursor_cell.is_some();
+    let blinking = focused
+        && (frame.cursor.is_some_and(|c| c.blinking)
+            || (ime_active && crate::settings::cursor_blink()));
     g.blinks = blinking;
     let blink_shown = !blinking || {
-        let cell = frame.cursor.map(|c| (c.x, c.y)).unwrap_or_default();
+        let (cx_, cy_) = frame.cursor.map(|c| (c.x, c.y)).or(frame.cursor_cell).unwrap_or_default();
+        let caret = if ime_active { marked_caret.unwrap_or(usize::MAX) } else { usize::MAX };
+        let at_pos = (cx_, cy_, caret);
         let (since, shown) = match g.blink {
-            // A cursor that moved, or started blinking, starts over shown.
-            Some((_, _, at)) if at != cell => (Instant::now(), true),
+            // A cursor (or IME caret) that moved starts over shown.
+            Some((_, _, at)) if at != at_pos => (Instant::now(), true),
             Some((since, shown, _)) if since.elapsed() < BLINK_PERIOD => (since, shown),
             _ => (Instant::now(), !g.blink.is_some_and(|(_, shown, _)| shown)),
         };
-        g.blink = Some((since, shown, cell));
+        g.blink = Some((since, shown, at_pos));
         shown
     };
     drop(g);
@@ -1902,8 +1929,8 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     // line rebuilds one row, not the whole screen.
     let ligatures = crate::settings::get().font_ligatures;
     let cursor = frame.cursor_cell.filter(|_| ligatures);
-    // personal: the weight is part of the key, so changing font_weight redraws.
-    let with = (crate::settings::font_size().to_bits(), cell, crate::settings::terminal_font(), crate::settings::fonts_added(), ligatures, crate::settings::font_weight().to_bits());
+    // personal: the weight and fallbacks are part of the key, so changing them redraws.
+    let with = (crate::settings::font_size().to_bits(), cell, crate::settings::terminal_font(), crate::settings::font_fallbacks(), crate::settings::fonts_added(), ligatures, crate::settings::font_weight().to_bits());
     // When every row changed (output scrolling), nothing is kept: the next
     // frame would find none of them the same.
     let mut painted = std::mem::take(&mut grid.borrow_mut().painted);
@@ -1989,17 +2016,15 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
 
     paint_images(false, window);
 
-    if let Some(cur) = frame.cursor {
+    if !ime_active
+        && let Some(cur) = frame.cursor
+        && !(cur.blinking && focused && !blink_shown)
+    {
         let (x, y) = (cur.x as usize, cur.y as usize);
         let wide = frame.rows.get(y).and_then(|r| r.get(x)).is_some_and(|c| c.wide);
         let w = cell.width * if wide { 2.0 } else { 1.0 };
         let color = hsla(cur.color);
         let p = at(x, y);
-        // personal: a blinking cursor is drawn on the on half of its cycle.
-        // Only a focused terminal blinks, so the pane with the keyboard moves.
-        if cur.blinking && focused && !blink_shown {
-            return;
-        }
         match (focused, cur.shape) {
             (true, CursorShape::Block) => {
                 window.paint_quad(fill(snap_box(Bounds::new(p, size(w, cell.height))), color));
@@ -2026,8 +2051,8 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     }
     // What an input method is composing, at the cursor (hidden or not):
     // underlined, on the terminal's background so the cells under it don't
-    // show through.
-    if let (Some((cx_, cy_)), Some(text)) = (frame.cursor_cell, marked.filter(|t| !t.is_empty())) {
+    // show through, with a blinking bar caret at the IME insertion offset.
+    if let (Some((cx_, cy_)), Some(text)) = (frame.cursor_cell, marked) {
         let p = at(cx_ as usize, cy_ as usize);
         let fg = hsla(vt::theme().fg);
         let run = TextRun {
@@ -2038,11 +2063,18 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
             underline: None,
             strikethrough: None,
         };
-        let line = window.text_system().shape_line(text.into(), px(crate::settings::font_size()), &[run], None);
+        let line = window.text_system().shape_line(text.clone().into(), px(crate::settings::font_size()), &[run], None);
         window.paint_quad(fill(snap_box(Bounds::new(p, size(line.width, cell.height))), hsla(frame.bg)));
         paint_cell_text(&line, p, metrics, window, cx);
         let underline = Bounds::new(p + point(px(0.0), metrics.underline), size(line.width, metrics.underline_thickness));
         window.paint_quad(fill(snap_box(underline), fg));
+        if focused && blink_shown {
+            let caret_u16 = marked_caret.unwrap_or_else(|| text.encode_utf16().count());
+            let caret_x = line.x_for_index(utf16_offset_to_utf8(&text, caret_u16));
+            let cur_color = frame.cursor.map_or(fg, |c| hsla(c.color));
+            let bar = Bounds::new(p + point(caret_x, px(0.0)), size(px(2.0), cell.height));
+            window.paint_quad(fill(snap_box(bar), cur_color));
+        }
     }
     {
         let mut g = grid.borrow_mut();
@@ -2084,8 +2116,10 @@ impl EntityInputHandler for TerminalView {
     }
 
     fn selected_text_range(&mut self, _ignore_disabled: bool, _w: &mut Window, _cx: &mut Context<Self>) -> Option<UTF16Selection> {
-        let len = self.grid.borrow().marked.as_ref().map_or(0, |m| m.encode_utf16().count());
-        Some(UTF16Selection { range: len..len, reversed: false })
+        let g = self.grid.borrow();
+        let len = g.marked.as_ref().map_or(0, |m| m.encode_utf16().count());
+        let caret = g.marked_caret.unwrap_or(len).min(len);
+        Some(UTF16Selection { range: caret..caret, reversed: false })
     }
 
     fn marked_text_range(&self, _w: &mut Window, _cx: &mut Context<Self>) -> Option<std::ops::Range<usize>> {
@@ -2093,12 +2127,21 @@ impl EntityInputHandler for TerminalView {
     }
 
     fn unmark_text(&mut self, _w: &mut Window, cx: &mut Context<Self>) {
-        self.grid.borrow_mut().marked = None;
+        let mut g = self.grid.borrow_mut();
+        g.marked = None;
+        g.marked_caret = None;
+        g.blink = None;
+        drop(g);
         cx.notify();
     }
 
     fn replace_text_in_range(&mut self, _range: Option<std::ops::Range<usize>>, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.grid.borrow_mut().marked = None;
+        {
+            let mut g = self.grid.borrow_mut();
+            g.marked = None;
+            g.marked_caret = None;
+            g.blink = None;
+        }
         // While the find field holds the keys, the input-method path must not
         // be a way around that (see `key_down`); with the terminal focused,
         // input methods type into the program as usual.
@@ -2112,7 +2155,7 @@ impl EntityInputHandler for TerminalView {
         &mut self,
         _range: Option<std::ops::Range<usize>>,
         text: &str,
-        _selected: Option<std::ops::Range<usize>>,
+        selected: Option<std::ops::Range<usize>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2121,7 +2164,18 @@ impl EntityInputHandler for TerminalView {
         if self.find_field_focused(window, cx) {
             return;
         }
-        self.grid.borrow_mut().marked = (!text.is_empty()).then(|| text.to_owned());
+        {
+            let mut g = self.grid.borrow_mut();
+            if text.is_empty() {
+                g.marked = None;
+                g.marked_caret = None;
+            } else {
+                let len = text.encode_utf16().count();
+                g.marked = Some(text.to_owned());
+                g.marked_caret = Some(selected.map_or(len, |r| r.end.min(len)));
+            }
+            g.blink = None;
+        }
         cx.notify();
     }
 
@@ -3540,6 +3594,15 @@ mod tests {
                 }
             }
         }).unwrap();
+    }
+
+    #[test]
+    fn utf16_offsets_map_to_utf8_boundaries_for_ime_carets() {
+        assert_eq!(super::utf16_offset_to_utf8("kan'jie'tu", 0), 0);
+        assert_eq!(super::utf16_offset_to_utf8("kan'jie'tu", 8), 8);
+        assert_eq!(super::utf16_offset_to_utf8("kan'jie'tu", 10), 10);
+        assert_eq!(super::utf16_offset_to_utf8("看截图", 1), 3);
+        assert_eq!(super::utf16_offset_to_utf8("a😀b", 3), 5);
     }
 
     #[test]

@@ -679,6 +679,9 @@ What's about the user, never a look:
 - `font_ligatures`: programming ligatures are off by default; set `true` to
   enable them in terminal fonts such as JetBrains Mono and Fira Code. The cursor
   and background changes (including selections) break ligatures so individual cells stay clear.
+- `font_fallbacks`: a fallback font family (or list of families) tried for
+  characters missing from `font` (such as CJK text or Nerd Font symbols) before
+  the operating system's default fallback chain.
 - `font_weight`: the terminals' text weight, 100 to 900 (500 by default,
   bold stays 700). Set `400` for the font's normal weight.
 - `cursor_style`: `"bar"`, `"block"` (default), `"underline"` or

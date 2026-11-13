@@ -380,6 +380,10 @@ pub struct Person {
     pub font_size: Option<f32>,
     /// Enable programming ligatures in terminal fonts.
     pub font_ligatures: bool,
+    // personal: terminal fallback font(s) for missing glyphs (e.g. CJK / icons).
+    /// Fallback font family (or list of families) tried before the OS defaults.
+    #[serde(default, deserialize_with = "deserialize_font_fallbacks", skip_serializing_if = "Vec::is_empty")]
+    pub font_fallbacks: Vec<String>,
     /// The panels' font (their sizes follow zoom).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_font: Option<String>,
@@ -453,6 +457,22 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+/// personal: accept either `"font_fallbacks": "LXGW WenKai"` or `["LXGW WenKai", ...]`.
+fn deserialize_font_fallbacks<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    let list = match Option::<OneOrMany>::deserialize(d)? {
+        None => Vec::new(),
+        Some(OneOrMany::One(s)) => vec![s],
+        Some(OneOrMany::Many(v)) => v,
+    };
+    Ok(list.into_iter().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect())
+}
+
 /// personal: settings.json's `cursor_style`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -473,6 +493,7 @@ impl Default for Person {
             font: None,
             font_size: None,
             font_ligatures: false,
+            font_fallbacks: Vec::new(),
             ui_font: None,
             font_weight: None,
             cursor_style: None,
@@ -497,7 +518,8 @@ pub struct Settings {
     pub font_family: String,
     pub font_size: f32,
     pub font_ligatures: bool,
-    // personal: terminal text weight and the cursor's shape and blinking.
+    // personal: terminal fallback fonts, text weight, and the cursor's shape and blinking.
+    pub font_fallbacks: Vec<String>,
     pub font_weight: f32,
     pub cursor_style: CursorStyle,
     pub cursor_blink: bool,
@@ -551,6 +573,7 @@ impl Default for Settings {
             font_family: DEFAULT_FONT.into(),
             font_size: 14.0,
             font_ligatures: false,
+            font_fallbacks: Vec::new(),
             font_weight: 500.0,
             cursor_style: CursorStyle::Block,
             cursor_blink: false,
@@ -592,6 +615,7 @@ impl Settings {
             font_family: look.font.clone().or(person.font.clone()).unwrap_or(d.font_family),
             font_size: look.font_size.or(person.font_size).unwrap_or(d.font_size),
             font_ligatures: person.font_ligatures,
+            font_fallbacks: person.font_fallbacks.clone(),
             ui_font_family: look.ui_font.clone().or(person.ui_font.clone()).unwrap_or(d.ui_font_family),
             ui_font_size: d.ui_font_size,
             font_weight: person.font_weight.map_or(d.font_weight, |w| f32::from(w.clamp(100, 900))),
@@ -801,6 +825,11 @@ pub fn ui_font_size() -> f32 {
     get().ui_font_size * zoom()
 }
 
+/// personal: fallback font families for glyphs missing from the terminal font.
+pub fn font_fallbacks() -> Vec<String> {
+    get().font_fallbacks.clone()
+}
+
 /// personal: normal terminal text's weight (bold text stays bold).
 pub fn font_weight() -> f32 {
     get().font_weight
@@ -991,11 +1020,20 @@ mod tests {
     /// settings.json key.
     #[test]
     fn the_guide_explains_every_setting() {
-        let all = Person { core: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), ui_font: Some(String::new()), telemetry: false, clipboard_write: false, appearance: Appearance::Light, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
+        let all = Person { core: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), font_fallbacks: vec!["x".into()], font_weight: Some(400), cursor_style: Some(CursorStyle::Bar), cursor_blink: Some(true), ui_font: Some(String::new()), telemetry: false, clipboard_write: false, appearance: Appearance::Light, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
         let keys: Vec<String> = serde_json::to_value(&all).unwrap().as_object().unwrap().keys().cloned().collect();
         let guide = include_str!("../defaults/AGENTS.md");
         let section = guide.split("## The person").nth(1).and_then(|s| s.split("\n## ").next()).unwrap_or_default();
         let missing: Vec<&String> = keys.iter().filter(|k| !section.contains(&format!("`{k}`"))).collect();
         assert!(missing.is_empty(), "defaults/AGENTS.md (## The person) doesn't explain: {missing:?}");
+    }
+
+    #[test]
+    fn font_fallbacks_accept_a_single_family_or_a_list() {
+        let single: Person = serde_json::from_str(r#"{"font_fallbacks": " LXGW WenKai "}"#).unwrap();
+        assert_eq!(single.font_fallbacks, vec!["LXGW WenKai"]);
+        let many: Person = serde_json::from_str(r#"{"font_fallbacks": ["LXGW WenKai", "", "Symbols Nerd Font"]}"#).unwrap();
+        assert_eq!(many.font_fallbacks, vec!["LXGW WenKai", "Symbols Nerd Font"]);
+        assert_eq!(Settings::compose(&many, &crate::layout::Look::default(), true).font_fallbacks, many.font_fallbacks);
     }
 }
