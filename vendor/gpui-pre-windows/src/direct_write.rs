@@ -327,6 +327,39 @@ impl PlatformTextSystem for DirectWriteTextSystem {
 }
 
 impl DirectWriteState {
+    /// HERDR: the COM address of a cached FontInfo's face, for checking that a
+    /// cached FontId draws from the face DirectWrite shaped a run with.
+    fn face_addr(&self, font_id: FontId) -> Option<usize> {
+        let info = self.fonts.get(font_id.0)?;
+        Some(info.font_face.cast::<IUnknown>().ok()?.as_raw().addr())
+    }
+
+    /// HERDR: cache a font that draws with exactly the given DirectWrite face,
+    /// rather than one the family name resolves to. Used when shaping fell back
+    /// to a face of another style (an italic CJK fallback, say), whose glyph ids
+    /// mean other characters in its family's other faces.
+    fn cache_face(
+        &mut self,
+        font_face: &IDWriteFontFace3,
+        font_face_key: usize,
+        locale: &HSTRING,
+        factory: &IDWriteFactory5,
+    ) -> Option<FontId> {
+        let font = font_face_to_font(font_face, locale)?;
+        let features = unsafe { Self::generate_font_features(factory, &font.features).log_err()? };
+        let font_id = FontId(self.fonts.len());
+        self.fonts.push(FontInfo {
+            font_family_h: HSTRING::from(font.family.as_ref()),
+            // The face DirectWrite shaped with: its glyph ids are the ones in the run.
+            font_face: font_face.clone(),
+            features,
+            fallbacks: None,
+            font_collection: self.system_font_collection.clone(),
+        });
+        self.font_info_cache.insert(font_face_key, font_id);
+        Some(font_id)
+    }
+
     fn select_and_cache_font(
         &mut self,
         components: &DirectWriteComponents,
@@ -411,8 +444,14 @@ impl DirectWriteState {
         Ok(())
     }
 
+    /// HERDR: `weight` and `style` are the run's. A fallback family's italic face
+    /// can cover different characters than its regular one, so asking for the
+    /// regular face would leave the italic run's characters unmapped (and, before
+    /// the face check in `DrawGlyphRun`, drew them with another face's glyphs).
     fn generate_font_fallbacks(
         fallbacks: &FontFallbacks,
+        weight: DWRITE_FONT_WEIGHT,
+        style: DWRITE_FONT_STYLE,
         factory: &IDWriteFactory5,
         system_font_collection: &IDWriteFontCollection1,
     ) -> Result<Option<IDWriteFontFallback>> {
@@ -427,12 +466,7 @@ impl DirectWriteState {
             for family_name in fallback_list {
                 let family_name = HSTRING::from(family_name);
                 let Some(fonts) = font_set
-                    .GetMatchingFonts(
-                        &family_name,
-                        DWRITE_FONT_WEIGHT_NORMAL,
-                        DWRITE_FONT_STRETCH_NORMAL,
-                        DWRITE_FONT_STYLE_NORMAL,
-                    )
+                    .GetMatchingFonts(&family_name, weight, DWRITE_FONT_STRETCH_NORMAL, style)
                     .log_err()
                 else {
                     continue;
@@ -516,10 +550,19 @@ impl DirectWriteState {
                 let font_face = unsafe { font_face_ref.CreateFontFace().log_err()? };
                 let direct_write_features =
                     unsafe { Self::generate_font_features(factory, features).log_err()? };
+                // HERDR: the fallback faces follow this face's weight and style.
+                let (weight, style) =
+                    unsafe { (font_face.GetWeight(), font_face.GetStyle()) };
                 let fallbacks = fallbacks.as_ref().and_then(|fallbacks| {
-                    Self::generate_font_fallbacks(fallbacks, factory, system_font_collection)
-                        .log_err()
-                        .flatten()
+                    Self::generate_font_fallbacks(
+                        fallbacks,
+                        weight,
+                        style,
+                        factory,
+                        system_font_collection,
+                    )
+                    .log_err()
+                    .flatten()
                 });
                 let font_info = FontInfo {
                     font_family_h: font_family_h.clone(),
@@ -1548,32 +1591,44 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         };
 
         let font_face_key = font_face.cast::<IUnknown>().unwrap().as_raw().addr();
-        let font_id = context
-            .text_system
-            .font_info_cache
-            .get(&font_face_key)
-            .copied()
-            // in some circumstances, we might be getting served a FontFace that we did not create ourselves
-            // so create a new font from it and cache it accordingly. The usual culprit here seems to be Segoe UI Symbol
-            .map_or_else(
-                || {
-                    let font = font_face_to_font(font_face, &self.locale)
-                        .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?;
-                    let font_id = match context.text_system.font_to_font_id.get(&font) {
-                        Some(&font_id) => font_id,
-                        None => context
+        // HERDR: glyph ids belong to the face DirectWrite shaped with, so a cached
+        // id is reused only when its FontInfo still holds exactly that face. A
+        // fallback face (italic CJK, say) can share its family with the run's own
+        // face; drawing one's ids with the other's glyphs renders other characters.
+        let font_id = match context.text_system.font_info_cache.get(&font_face_key).copied() {
+            Some(font_id) if context.text_system.face_addr(font_id) == Some(font_face_key) => font_id,
+            _ => {
+                let font = font_face_to_font(font_face, &self.locale)
+                    .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?;
+                let resolved = context.text_system.font_to_font_id.get(&font).copied().or_else(|| {
+                    context.text_system.select_and_cache_font(context.components, &font)
+                });
+                // In some circumstances we might be served a FontFace we did not
+                // create ourselves (Segoe UI Symbol is the usual culprit), and the
+                // family lookup can land on another style of it.
+                let font_id = match resolved {
+                    Some(font_id) if context.text_system.face_addr(font_id) == Some(font_face_key) => font_id,
+                    other => {
+                        log::warn!(
+                            "windows text: the family's face ({:?} {:?} {:?}) is not the one DirectWrite shaped with; \
+                             keeping that face's own glyphs (cached {other:?})",
+                            font.family,
+                            font.style,
+                            font.weight
+                        );
+                        context
                             .text_system
-                            .select_and_cache_font(context.components, &font)
-                            .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?,
-                    };
-                    context
-                        .text_system
-                        .font_info_cache
-                        .insert(font_face_key, font_id);
-                    windows::core::Result::Ok(font_id)
-                },
-                Ok,
-            )?;
+                            .cache_face(font_face, font_face_key, &self.locale, &context.components.factory)
+                            .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?
+                    }
+                };
+                context
+                    .text_system
+                    .font_info_cache
+                    .insert(font_face_key, font_id);
+                font_id
+            }
+        };
 
         let color_font = unsafe { font_face.IsColorFont().as_bool() };
 
